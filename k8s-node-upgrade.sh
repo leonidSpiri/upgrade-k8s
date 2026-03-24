@@ -233,8 +233,6 @@ preflight_common() {
 
   kubectl --kubeconfig "$KUBECONFIG_PATH" version >/dev/null 2>&1 || die "kubectl не может подключиться к кластеру через $KUBECONFIG_PATH"
   kubectl --kubeconfig "$KUBECONFIG_PATH" get node "$NODE_NAME" >/dev/null 2>&1 || die "Node '$NODE_NAME' не найдена в кластере. Укажи правильное имя через --node-name."
-  precheck_drain
-
   if [[ -z "$TARGET_VERSION" ]]; then
     TARGET_VERSION=$(fetch_latest_stable)
   fi
@@ -443,40 +441,29 @@ build_drain_args() {
   printf '%q ' "${args[@]}"
 }
 
-precheck_drain() {
+drain_node() {
   local output rc=0
-  log "Проверяю, что drain node пройдет без неожиданных блокеров"
-  if output=$(kubectl --kubeconfig "$KUBECONFIG_PATH" drain $(build_drain_args) --dry-run=server 2>&1); then
+  log "Drain node: $NODE_NAME"
+  if output=$(kubectl --kubeconfig "$KUBECONFIG_PATH" drain $(build_drain_args) 2>&1); then
+    printf '%s
+' "$output"
     return 0
   fi
   rc=$?
 
-  if grep -q "cannot delete Pods with local storage" <<<"$output"; then
-    warn "На node есть Pod'ы с emptyDir/local ephemeral storage. По умолчанию сценарий останавливается, чтобы не потерять эти данные."
-    warn "Если для этих Pod'ов допустима потеря emptyDir-данных, перезапусти с флагом: --allow-emptydir-loss true"
-    warn "Подробности drain:"
-    printf '%s
+  printf '%s
 ' "$output" >&2
-    die "Drain precheck не пройден: найдены Pod'ы с local storage."
+
+  if grep -q "cannot delete Pods with local storage" <<<"$output"; then
+    warn "Drain остановлен: на node есть Pod'ы с emptyDir/local ephemeral storage."
+    warn "Если потеря данных в emptyDir допустима, перезапусти сценарий с флагом: --allow-emptydir-loss true"
   fi
 
   if grep -q "cannot evict pod as it would violate the pod's disruption budget" <<<"$output"; then
     warn "Drain блокируется PodDisruptionBudget. Сначала увеличь доступность workload'а или временно измени PDB."
-    warn "Подробности drain:"
-    printf '%s
-' "$output" >&2
-    die "Drain precheck не пройден: PodDisruptionBudget блокирует eviction."
   fi
 
-  warn "Drain precheck вернул ошибку. Подробности:"
-  printf '%s
-' "$output" >&2
   return "$rc"
-}
-
-drain_node() {
-  log "Drain node: $NODE_NAME"
-  run "kubectl --kubeconfig '$KUBECONFIG_PATH' drain $(build_drain_args)"
 }
 
 uncordon_node() {
