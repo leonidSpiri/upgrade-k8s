@@ -233,6 +233,7 @@ preflight_common() {
 
   kubectl --kubeconfig "$KUBECONFIG_PATH" version >/dev/null 2>&1 || die "kubectl не может подключиться к кластеру через $KUBECONFIG_PATH"
   kubectl --kubeconfig "$KUBECONFIG_PATH" get node "$NODE_NAME" >/dev/null 2>&1 || die "Node '$NODE_NAME' не найдена в кластере. Укажи правильное имя через --node-name."
+  precheck_drain
 
   if [[ -z "$TARGET_VERSION" ]]; then
     TARGET_VERSION=$(fetch_latest_stable)
@@ -307,30 +308,14 @@ backup_control_plane_files() {
   fi
 }
 
-find_local_etcd_pod() {
-  local pod=""
-  pod=$(kubectl --kubeconfig "$KUBECONFIG_PATH" -n kube-system     get pod -l component=etcd     --field-selector "spec.nodeName=$NODE_NAME"     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-
-  if [[ -z "$pod" ]]; then
-    pod=$(kubectl --kubeconfig "$KUBECONFIG_PATH" -n kube-system       get pod "etcd-$NODE_NAME"       -o jsonpath='{.metadata.name}' 2>/dev/null || true)
-  fi
-
-  printf '%s' "$pod"
-}
-
 etcd_snapshot_if_needed() {
   if [[ "$CONTROL_PLANE" != "true" ]]; then
     return
   fi
 
-  if [[ ! -f /etc/kubernetes/manifests/etcd.yaml ]]; then
-    warn "Локальный stacked etcd не найден. Если у тебя external etcd — snapshot делай отдельно на etcd members."
-    return
-  fi
-
-  log "Обнаружен stacked etcd. Снимаю snapshot."
-
-  if command -v etcdctl >/dev/null 2>&1; then
+  if [[ -f /etc/kubernetes/manifests/etcd.yaml ]]; then
+    require_cmd etcdctl
+    log "Обнаружен stacked etcd. Снимаю snapshot."
     run "ETCDCTL_API=3 etcdctl \
       --endpoints=https://127.0.0.1:2379 \
       --cacert=/etc/kubernetes/pki/etcd/ca.crt \
@@ -343,23 +328,9 @@ etcd_snapshot_if_needed() {
       --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
       --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
       snapshot save '$BACKUP_DIR/etcd-snapshot.db'"
-    return
+  else
+    warn "Локальный stacked etcd не найден. Если у тебя external etcd — snapshot делай отдельно на etcd members."
   fi
-
-  local etcd_pod host_tmp_snapshot
-  etcd_pod=$(find_local_etcd_pod)
-  [[ -n "$etcd_pod" ]] || die "Не найден локальный etcd static pod для этой control-plane node, а команды etcdctl на host нет."
-
-  warn "Команда etcdctl на host не найдена. Использую etcdctl из static pod $etcd_pod."
-  host_tmp_snapshot="/var/lib/etcd/pre-upgrade-${NODE_NAME}-$(date -u +%Y%m%dT%H%M%SZ).db"
-
-  run "kubectl --kubeconfig '$KUBECONFIG_PATH' -n kube-system exec '$etcd_pod' --     etcdctl       --endpoints=https://127.0.0.1:2379       --cacert=/etc/kubernetes/pki/etcd/ca.crt       --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt       --key=/etc/kubernetes/pki/etcd/healthcheck-client.key       endpoint health > '$BACKUP_DIR/etcd-health.txt'"
-
-  run "kubectl --kubeconfig '$KUBECONFIG_PATH' -n kube-system exec '$etcd_pod' --     etcdctl       --endpoints=https://127.0.0.1:2379       --cacert=/etc/kubernetes/pki/etcd/ca.crt       --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt       --key=/etc/kubernetes/pki/etcd/healthcheck-client.key       snapshot save '$host_tmp_snapshot'"
-
-  [[ -f "$host_tmp_snapshot" ]] || die "Snapshot создан в pod, но не найден на host по пути $host_tmp_snapshot. Проверь, что /var/lib/etcd смонтирован как hostPath."
-  run "cp -a '$host_tmp_snapshot' '$BACKUP_DIR/etcd-snapshot.db'"
-  run "rm -f '$host_tmp_snapshot'"
 }
 
 ensure_pkgs_repo_minor() {
@@ -470,6 +441,37 @@ build_drain_args() {
     args+=(--delete-emptydir-data)
   fi
   printf '%q ' "${args[@]}"
+}
+
+precheck_drain() {
+  local output rc=0
+  log "Проверяю, что drain node пройдет без неожиданных блокеров"
+  if output=$(kubectl --kubeconfig "$KUBECONFIG_PATH" drain $(build_drain_args) --dry-run=server 2>&1); then
+    return 0
+  fi
+  rc=$?
+
+  if grep -q "cannot delete Pods with local storage" <<<"$output"; then
+    warn "На node есть Pod'ы с emptyDir/local ephemeral storage. По умолчанию сценарий останавливается, чтобы не потерять эти данные."
+    warn "Если для этих Pod'ов допустима потеря emptyDir-данных, перезапусти с флагом: --allow-emptydir-loss true"
+    warn "Подробности drain:"
+    printf '%s
+' "$output" >&2
+    die "Drain precheck не пройден: найдены Pod'ы с local storage."
+  fi
+
+  if grep -q "cannot evict pod as it would violate the pod's disruption budget" <<<"$output"; then
+    warn "Drain блокируется PodDisruptionBudget. Сначала увеличь доступность workload'а или временно измени PDB."
+    warn "Подробности drain:"
+    printf '%s
+' "$output" >&2
+    die "Drain precheck не пройден: PodDisruptionBudget блокирует eviction."
+  fi
+
+  warn "Drain precheck вернул ошибку. Подробности:"
+  printf '%s
+' "$output" >&2
+  return "$rc"
 }
 
 drain_node() {
