@@ -473,7 +473,9 @@ sudo ./k8s-node-upgrade.sh \
 
 Ниже шаблоны. Подставь свой URL репозитория.
 
-### HTTPS
+### Вариант 1: клонировать репозиторий целиком
+
+#### HTTPS
 
 ```bash
 git clone https://github.com/<org>/<repo>.git
@@ -482,7 +484,7 @@ chmod +x k8s-node-upgrade.sh
 chmod +x test_k8s_node_upgrade.sh
 ```
 
-### SSH
+#### SSH
 
 ```bash
 git clone git@github.com:<org>/<repo>.git
@@ -490,6 +492,32 @@ cd <repo>
 chmod +x k8s-node-upgrade.sh
 chmod +x test_k8s_node_upgrade.sh
 ```
+
+### Вариант 2: скачать только скрипт напрямую
+
+Если репозиторий публичный:
+
+```bash
+curl -LO https://raw.githubusercontent.com/<org>/<repo>/<branch>/k8s-node-upgrade.sh
+chmod +x k8s-node-upgrade.sh
+```
+
+И для теста:
+
+```bash
+curl -LO https://raw.githubusercontent.com/<org>/<repo>/<branch>/test_k8s_node_upgrade.sh
+chmod +x test_k8s_node_upgrade.sh
+```
+
+### Вариант 3: скачать конкретный tag/release
+
+```bash
+git clone --branch <tag-or-branch> --depth 1 https://github.com/<org>/<repo>.git
+cd <repo>
+chmod +x k8s-node-upgrade.sh
+chmod +x test_k8s_node_upgrade.sh
+```
+
 ---
 
 ## Как запускать тесты
@@ -522,7 +550,9 @@ bash ./test_k8s_node_upgrade.sh
 
 Для control-plane со stacked etcd:
 
-- `etcdctl`
+- `etcdctl` на host **не обязателен**
+- если `etcdctl` на host отсутствует, скрипт использует `etcdctl` из локального `etcd` static pod и сохраняет snapshot через hostPath `/var/lib/etcd`
+- для `external etcd` snapshot по-прежнему нужно делать отдельно на самих etcd members
 
 ---
 
@@ -549,6 +579,18 @@ bash ./test_k8s_node_upgrade.sh
 ### 4. Следи за deprecated APIs
 
 Если в кластере есть старые манифесты или charts с устаревшими API versions, cluster может обновиться, а отдельные workloads — сломаться.
+
+### 5. Если раньше падало на `ERROR: Не найдена команда: etcdctl`
+
+Это относилось к ранней версии скрипта, где был жёсткий `require_cmd etcdctl`.
+
+В актуальной версии скрипта логика такая:
+
+- если `etcdctl` есть на host — snapshot делается им;
+- если `etcdctl` на host нет, но на node есть локальный `etcd` static pod — snapshot делается через него;
+- если используется `external etcd`, этот snapshot скрипт не делает, потому что его нужно выполнять отдельно на etcd members.
+
+Если у тебя всё ещё старый файл скрипта, просто замени его на актуальный из репозитория.
 
 ### 5. Для 1.35 скрипт проверяет cgroups v2
 

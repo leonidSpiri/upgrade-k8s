@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME=$(basename "$0")
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 ROLE="auto"                    # auto|control-plane|worker
 FIRST_CONTROL_PLANE="false"   # true only for the first CP node in each minor step
@@ -307,14 +307,30 @@ backup_control_plane_files() {
   fi
 }
 
+find_local_etcd_pod() {
+  local pod=""
+  pod=$(kubectl --kubeconfig "$KUBECONFIG_PATH" -n kube-system     get pod -l component=etcd     --field-selector "spec.nodeName=$NODE_NAME"     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+  if [[ -z "$pod" ]]; then
+    pod=$(kubectl --kubeconfig "$KUBECONFIG_PATH" -n kube-system       get pod "etcd-$NODE_NAME"       -o jsonpath='{.metadata.name}' 2>/dev/null || true)
+  fi
+
+  printf '%s' "$pod"
+}
+
 etcd_snapshot_if_needed() {
   if [[ "$CONTROL_PLANE" != "true" ]]; then
     return
   fi
 
-  if [[ -f /etc/kubernetes/manifests/etcd.yaml ]]; then
-    require_cmd etcdctl
-    log "Обнаружен stacked etcd. Снимаю snapshot."
+  if [[ ! -f /etc/kubernetes/manifests/etcd.yaml ]]; then
+    warn "Локальный stacked etcd не найден. Если у тебя external etcd — snapshot делай отдельно на etcd members."
+    return
+  fi
+
+  log "Обнаружен stacked etcd. Снимаю snapshot."
+
+  if command -v etcdctl >/dev/null 2>&1; then
     run "ETCDCTL_API=3 etcdctl \
       --endpoints=https://127.0.0.1:2379 \
       --cacert=/etc/kubernetes/pki/etcd/ca.crt \
@@ -327,9 +343,23 @@ etcd_snapshot_if_needed() {
       --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
       --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
       snapshot save '$BACKUP_DIR/etcd-snapshot.db'"
-  else
-    warn "Локальный stacked etcd не найден. Если у тебя external etcd — snapshot делай отдельно на etcd members."
+    return
   fi
+
+  local etcd_pod host_tmp_snapshot
+  etcd_pod=$(find_local_etcd_pod)
+  [[ -n "$etcd_pod" ]] || die "Не найден локальный etcd static pod для этой control-plane node, а команды etcdctl на host нет."
+
+  warn "Команда etcdctl на host не найдена. Использую etcdctl из static pod $etcd_pod."
+  host_tmp_snapshot="/var/lib/etcd/pre-upgrade-${NODE_NAME}-$(date -u +%Y%m%dT%H%M%SZ).db"
+
+  run "kubectl --kubeconfig '$KUBECONFIG_PATH' -n kube-system exec '$etcd_pod' --     etcdctl       --endpoints=https://127.0.0.1:2379       --cacert=/etc/kubernetes/pki/etcd/ca.crt       --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt       --key=/etc/kubernetes/pki/etcd/healthcheck-client.key       endpoint health > '$BACKUP_DIR/etcd-health.txt'"
+
+  run "kubectl --kubeconfig '$KUBECONFIG_PATH' -n kube-system exec '$etcd_pod' --     etcdctl       --endpoints=https://127.0.0.1:2379       --cacert=/etc/kubernetes/pki/etcd/ca.crt       --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt       --key=/etc/kubernetes/pki/etcd/healthcheck-client.key       snapshot save '$host_tmp_snapshot'"
+
+  [[ -f "$host_tmp_snapshot" ]] || die "Snapshot создан в pod, но не найден на host по пути $host_tmp_snapshot. Проверь, что /var/lib/etcd смонтирован как hostPath."
+  run "cp -a '$host_tmp_snapshot' '$BACKUP_DIR/etcd-snapshot.db'"
+  run "rm -f '$host_tmp_snapshot'"
 }
 
 ensure_pkgs_repo_minor() {
