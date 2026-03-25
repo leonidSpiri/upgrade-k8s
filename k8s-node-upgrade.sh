@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME=$(basename "$0")
-VERSION="1.1.0"
+VERSION="1.1.2"
 
 ROLE="auto"                    # auto|control-plane|worker|jump-host
 FIRST_CONTROL_PLANE="false"   # true only for the first CP node in each minor step
@@ -38,7 +38,7 @@ $SCRIPT_NAME v$VERSION
   sudo $SCRIPT_NAME --role control-plane --first-control-plane false --kubeconfig /etc/kubernetes/admin.conf
   sudo $SCRIPT_NAME --role worker --kubeconfig /root/.kube/admin.conf
   sudo $SCRIPT_NAME --role jump-host
-  sudo $SCRIPT_NAME --role jump-host --kubeconfig /root/.kube/admin.conf
+  sudo $SCRIPT_NAME --role jump-host --kubeconfig /root/.kube/config
   sudo $SCRIPT_NAME --role worker --kubeconfig /root/.kube/admin.conf --helm true
   sudo $SCRIPT_NAME --rollback-from /var/backups/k8s-upgrade/20260324T120000Z-node01
 
@@ -221,7 +221,6 @@ current_local_kubectl_version() {
   kubectl version --client -o yaml 2>/dev/null | awk '/gitVersion:/ {print $2; exit}' | sed 's/^v//'
 }
 
-
 fetch_latest_stable() {
   curl -fsSL https://dl.k8s.io/release/stable.txt | sed 's/^v//'
 }
@@ -261,8 +260,6 @@ preflight_common() {
   kubectl --kubeconfig "$KUBECONFIG_PATH" version >/dev/null 2>&1 || die "kubectl не может подключиться к кластеру через $KUBECONFIG_PATH"
   kubectl --kubeconfig "$KUBECONFIG_PATH" get node "$NODE_NAME" >/dev/null 2>&1 || die "Node '$NODE_NAME' не найдена в кластере. Укажи правильное имя через --node-name."
 
-  local cur
-  cur=$(current_local_kubelet_version)
   if [[ "$(version_major_minor "$TARGET_VERSION")" == "1.35" ]]; then
     if [[ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)" != "cgroup2fs" ]]; then
       die "Целевой релиз 1.35 ожидает cgroups v2 на Linux nodes. На этой node обнаружен не cgroup2fs."
@@ -285,15 +282,9 @@ metadata_file() {
 
 save_metadata() {
   local prev_kubeadm="" prev_kubelet="" prev_kubectl=""
-  if command -v kubeadm >/dev/null 2>&1; then
-    prev_kubeadm=$(kubeadm version -o short 2>/dev/null | sed 's/^v//')
-  fi
-  if [[ "$ROLE" != "jump-host" ]] && command -v kubelet >/dev/null 2>&1; then
-    prev_kubelet=$(current_local_kubelet_version)
-  fi
-  if command -v kubectl >/dev/null 2>&1; then
-    prev_kubectl=$(current_local_kubectl_version)
-  fi
+  if command -v kubeadm >/dev/null 2>&1; then prev_kubeadm=$(kubeadm version -o short 2>/dev/null | sed 's/^v//' || true); fi
+  if command -v kubelet >/dev/null 2>&1; then prev_kubelet=$(current_local_kubelet_version 2>/dev/null || true); fi
+  if command -v kubectl >/dev/null 2>&1; then prev_kubectl=$(current_local_kubectl_version 2>/dev/null || true); fi
 
   cat > "$(metadata_file)" <<META
 ROLE=$ROLE
@@ -318,14 +309,13 @@ backup_repo_file() {
 }
 
 backup_cluster_views() {
-  run "kubectl version --client -o yaml > '$BACKUP_DIR/kubectl-client-version.yaml'"
-  if [[ -z "$KUBECONFIG_PATH" || ! -f "$KUBECONFIG_PATH" ]]; then
-    warn "kubeconfig не передан: пропускаю backup cluster view через kubectl."
-  else
+  if [[ -n "$KUBECONFIG_PATH" && -f "$KUBECONFIG_PATH" ]]; then
     run "kubectl --kubeconfig '$KUBECONFIG_PATH' version -o yaml > '$BACKUP_DIR/kubectl-version.yaml'"
     run "kubectl --kubeconfig '$KUBECONFIG_PATH' get nodes -o wide > '$BACKUP_DIR/nodes.txt'"
     run "kubectl --kubeconfig '$KUBECONFIG_PATH' get pods -A -o wide > '$BACKUP_DIR/pods-wide.txt'"
     run "kubectl --kubeconfig '$KUBECONFIG_PATH' get ds,deploy,sts,svc,ing,job,cronjob,pvc,pv -A -o yaml > '$BACKUP_DIR/cluster-objects.yaml'"
+  else
+    run "kubectl version --client -o yaml > '$BACKUP_DIR/kubectl-version.yaml'"
   fi
   if command -v helm >/dev/null 2>&1; then
     run "helm list -A -o yaml > '$BACKUP_DIR/helm-releases.yaml' || true"
@@ -346,52 +336,53 @@ etcd_snapshot_if_needed() {
   fi
 
   if [[ -f /etc/kubernetes/manifests/etcd.yaml ]]; then
-    require_cmd etcdctl
     log "Обнаружен stacked etcd. Снимаю snapshot."
-    run "ETCDCTL_API=3 etcdctl \
-      --endpoints=https://127.0.0.1:2379 \
-      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
-      --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
-      --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
-      endpoint health > '$BACKUP_DIR/etcd-health.txt'"
-    run "ETCDCTL_API=3 etcdctl \
-      --endpoints=https://127.0.0.1:2379 \
-      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
-      --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
-      --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
-      snapshot save '$BACKUP_DIR/etcd-snapshot.db'"
+    if command -v etcdctl >/dev/null 2>&1; then
+      run "ETCDCTL_API=3 etcdctl \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+        --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+        endpoint health > '$BACKUP_DIR/etcd-health.txt'"
+      run "ETCDCTL_API=3 etcdctl \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+        --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+        snapshot save '$BACKUP_DIR/etcd-snapshot.db'"
+    else
+      local etcd_pod
+      etcd_pod=$(kubectl --kubeconfig "$KUBECONFIG_PATH" -n kube-system get pod -l component=etcd -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+      [[ -n "$etcd_pod" ]] || die "Не найден локальный etcd pod и не установлен etcdctl."
+      run "kubectl --kubeconfig '$KUBECONFIG_PATH' -n kube-system exec '$etcd_pod' -- sh -c 'ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt --key=/etc/kubernetes/pki/etcd/healthcheck-client.key endpoint health' > '$BACKUP_DIR/etcd-health.txt'"
+      run "kubectl --kubeconfig '$KUBECONFIG_PATH' -n kube-system exec '$etcd_pod' -- sh -c 'rm -f /var/lib/etcd/etcd-snapshot.db && ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt --key=/etc/kubernetes/pki/etcd/healthcheck-client.key snapshot save /var/lib/etcd/etcd-snapshot.db'"
+      run "cp -a /var/lib/etcd/etcd-snapshot.db '$BACKUP_DIR/etcd-snapshot.db'"
+    fi
   else
     warn "Локальный stacked etcd не найден. Если у тебя external etcd — snapshot делай отдельно на etcd members."
   fi
 }
 
-ensure_pkgs_repo_minor() {
+ensure_apt_k8s_keyring() {
   local desired_minor="$1"
+  local keyring="/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+  require_cmd gpg
+  run "mkdir -p /etc/apt/keyrings"
+  run "curl -fsSL 'https://pkgs.k8s.io/core:/stable:/v${desired_minor}/deb/Release.key' | gpg --dearmor -o '$keyring.tmp'"
+  run "install -m 0644 '$keyring.tmp' '$keyring'"
+  run "rm -f '$keyring.tmp'"
+}
 
-  if [[ ! -f "$PKG_REPO_FILE" ]]; then
-    if [[ "$FORCE_REPO_SWITCH" != "true" ]]; then
-      die "Не найден repo file $PKG_REPO_FILE. Создай/проверь его или используй --force-repo-switch."
-    fi
-    warn "Repo file не найден, но включен --force-repo-switch. Буду создавать новый файл."
-  fi
+write_pkgs_repo_file() {
+  local desired_minor="$1"
 
   case "$PKG_FAMILY" in
     apt)
-      if [[ -f "$PKG_REPO_FILE" ]] && grep -q 'pkgs\.k8s\.io\|pkgs\.kubernetes\.io\|packages\.kubernetes\.io' "$PKG_REPO_FILE"; then
-        run "sed -E -i 's#core:/stable:/v[0-9]+\.[0-9]+/#core:/stable:/v${desired_minor}/#g' '$PKG_REPO_FILE'"
-      else
-        [[ "$FORCE_REPO_SWITCH" == "true" ]] || die "В $PKG_REPO_FILE не найден pkgs.k8s.io repo. Старый legacy repo нужно мигрировать отдельно."
-        run "mkdir -p /etc/apt/keyrings"
-        run "printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${desired_minor}/deb/ /' > '$PKG_REPO_FILE'"
-      fi
-      run "apt-get update"
+      ensure_apt_k8s_keyring "$desired_minor"
+      run "printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${desired_minor}/deb/ /' > '$PKG_REPO_FILE'"
       ;;
     yum|dnf|dnf5)
-      if [[ -f "$PKG_REPO_FILE" ]] && grep -q 'pkgs\.k8s\.io\|pkgs\.kubernetes\.io\|packages\.kubernetes\.io' "$PKG_REPO_FILE"; then
-        run "sed -E -i 's#core:/stable:/v[0-9]+\.[0-9]+/#core:/stable:/v${desired_minor}/#g' '$PKG_REPO_FILE'"
-      else
-        [[ "$FORCE_REPO_SWITCH" == "true" ]] || die "В $PKG_REPO_FILE не найден pkgs.k8s.io repo. Старый legacy repo нужно мигрировать отдельно."
-        run "cat > '$PKG_REPO_FILE' <<YUMREPO
+      run "cat > '$PKG_REPO_FILE' <<YUMREPO
 [kubernetes]
 name=Kubernetes
 baseurl=https://pkgs.k8s.io/core:/stable:/v${desired_minor}/rpm/
@@ -400,6 +391,46 @@ gpgcheck=1
 gpgkey=https://pkgs.k8s.io/core:/stable:/v${desired_minor}/rpm/repodata/repomd.xml.key
 exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 YUMREPO"
+      ;;
+    *) die "Неподдерживаемый PKG_FAMILY=$PKG_FAMILY" ;;
+  esac
+}
+
+ensure_pkgs_repo_minor() {
+  local desired_minor="$1"
+  local allow_create="false"
+
+  if [[ "$ROLE" == "jump-host" || "$FORCE_REPO_SWITCH" == "true" ]]; then
+    allow_create="true"
+  fi
+
+  if [[ ! -f "$PKG_REPO_FILE" ]]; then
+    if [[ "$allow_create" != "true" ]]; then
+      die "Не найден repo file $PKG_REPO_FILE. Создай/проверь его или используй --force-repo-switch."
+    fi
+    warn "Repo file не найден: $PKG_REPO_FILE. Создаю официальный pkgs.k8s.io repo для v${desired_minor}."
+    write_pkgs_repo_file "$desired_minor"
+  fi
+
+  case "$PKG_FAMILY" in
+    apt)
+      if grep -q 'pkgs\.k8s\.io\|pkgs\.kubernetes\.io\|packages\.kubernetes\.io' "$PKG_REPO_FILE"; then
+        ensure_apt_k8s_keyring "$desired_minor"
+        run "sed -E -i 's#core:/stable:/v[0-9]+\.[0-9]+/#core:/stable:/v${desired_minor}/#g' '$PKG_REPO_FILE'"
+      else
+        [[ "$allow_create" == "true" ]] || die "В $PKG_REPO_FILE не найден pkgs.k8s.io repo. Старый legacy repo нужно мигрировать отдельно или запустить с --force-repo-switch."
+        warn "В $PKG_REPO_FILE не найден pkgs.k8s.io repo. Переписываю файл на официальный repo v${desired_minor}."
+        write_pkgs_repo_file "$desired_minor"
+      fi
+      run "apt-get update"
+      ;;
+    yum|dnf|dnf5)
+      if grep -q 'pkgs\.k8s\.io\|pkgs\.kubernetes\.io\|packages\.kubernetes\.io' "$PKG_REPO_FILE"; then
+        run "sed -E -i 's#core:/stable:/v[0-9]+\.[0-9]+/#core:/stable:/v${desired_minor}/#g' '$PKG_REPO_FILE'"
+      else
+        [[ "$allow_create" == "true" ]] || die "В $PKG_REPO_FILE не найден pkgs.k8s.io repo. Старый legacy repo нужно мигрировать отдельно или запустить с --force-repo-switch."
+        warn "В $PKG_REPO_FILE не найден pkgs.k8s.io repo. Переписываю файл на официальный repo v${desired_minor}."
+        write_pkgs_repo_file "$desired_minor"
       fi
       if command -v yum >/dev/null 2>&1; then
         run "yum clean all"
@@ -533,64 +564,30 @@ current_cluster_minor_from_local() {
   version_major_minor "$(current_local_kubelet_version)"
 }
 
-check_jump_host_kubectl_skew_if_possible() {
-  [[ -n "$KUBECONFIG_PATH" && -f "$KUBECONFIG_PATH" ]] || return 0
-
-  local server_version server_minor target_minor server_minor_n target_minor_n diff
-  server_version=$(kubectl --kubeconfig "$KUBECONFIG_PATH" version -o yaml 2>/dev/null | awk '
-    /serverVersion:/ {in_server=1; next}
-    in_server && /gitVersion:/ {print $2; exit}
-  ' | sed 's/^v//; s/"//g')
-  [[ -n "$server_version" ]] || return 0
-
-  server_minor=$(version_major_minor "$server_version")
-  target_minor=$(version_major_minor "$TARGET_VERSION")
-  server_minor_n=${server_minor#*.}
-  target_minor_n=${target_minor#*.}
-  diff=$(( target_minor_n - server_minor_n ))
-  if (( diff < 0 )); then
-    diff=$(( -diff ))
-  fi
-
-  if (( diff > 1 )); then
-    die "Целевой kubectl v$TARGET_VERSION выходит за поддерживаемый skew относительно kube-apiserver v$server_version. Для jump host kubectl должен быть в пределах одной minor-версии от control plane."
-  fi
-}
-
 execute_jump_host_upgrade() {
   local current_version target_minor kubectl_pkg
   current_version=$(current_local_kubectl_version)
-  [[ -n "$current_version" ]] || die "Не удалось определить текущую версию kubectl."
-
-  if ! version_lt "$current_version" "$TARGET_VERSION" && ! version_eq "$current_version" "$TARGET_VERSION"; then
-    die "Локальная версия kubectl $current_version новее целевой $TARGET_VERSION."
-  fi
-
-  if version_eq "$current_version" "$TARGET_VERSION"; then
-    log "Jump host уже на целевой версии kubectl v$TARGET_VERSION."
-    return
-  fi
-
-  check_jump_host_kubectl_skew_if_possible
-
   target_minor=$(version_major_minor "$TARGET_VERSION")
+
+  if [[ -n "$current_version" ]]; then
+    if ! version_lt "$current_version" "$TARGET_VERSION" && ! version_eq "$current_version" "$TARGET_VERSION"; then
+      die "Локальная версия kubectl $current_version новее целевой $TARGET_VERSION."
+    fi
+    if version_eq "$current_version" "$TARGET_VERSION"; then
+      log "Jump host уже на целевой версии kubectl v$TARGET_VERSION."
+      return
+    fi
+  fi
+
   log "Jump host: обновляю только kubectl до v$TARGET_VERSION"
   ensure_pkgs_repo_minor "$target_minor"
   kubectl_pkg=$(resolve_pkg_version kubectl "$TARGET_VERSION")
   [[ -n "$kubectl_pkg" ]] || die "Не найдена версия kubectl для $TARGET_VERSION"
   pkg_install_exact kubectl "$kubectl_pkg"
   run "kubectl version --client"
-  if [[ -n "$KUBECONFIG_PATH" && -f "$KUBECONFIG_PATH" ]]; then
-    run "kubectl --kubeconfig '$KUBECONFIG_PATH' version"
-  fi
 }
 
 execute_upgrade() {
-  if [[ "$ROLE" == "jump-host" ]]; then
-    execute_jump_host_upgrade
-    return
-  fi
-
   local current_version current_minor target_minor next_minor step_version
   current_version=$(current_local_kubelet_version)
   target_minor=$(version_major_minor "$TARGET_VERSION")
@@ -717,12 +714,16 @@ main() {
     etcd_snapshot_if_needed
   fi
 
-  log "Старт upgrade: role=$ROLE first_control_plane=$FIRST_CONTROL_PLANE node=${NODE_NAME:-n/a} target=v$TARGET_VERSION"
-  execute_upgrade
+  log "Старт upgrade: role=$ROLE first_control_plane=$FIRST_CONTROL_PLANE node=$NODE_NAME target=v$TARGET_VERSION"
+  if [[ "$ROLE" == "jump-host" ]]; then
+    execute_jump_host_upgrade
+  else
+    execute_upgrade
+  fi
   update_helm_if_requested
 
   if [[ "$ROLE" == "jump-host" ]]; then
-    log "Готово. Jump host обновлен: kubectl v$(current_local_kubectl_version)."
+    log "Готово. Jump host $NODE_NAME обновлен: kubectl v$(current_local_kubectl_version)."
   else
     log "Готово. Node $NODE_NAME обновлена до Kubernetes v$(current_local_kubelet_version)."
   fi
