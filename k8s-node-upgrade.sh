@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME=$(basename "$0")
-VERSION="1.0.1"
+VERSION="1.1.0"
 
-ROLE="auto"                    # auto|control-plane|worker
+ROLE="auto"                    # auto|control-plane|worker|jump-host
 FIRST_CONTROL_PLANE="false"   # true only for the first CP node in each minor step
 UPDATE_HELM="false"           # true|false
 DRY_RUN="false"
@@ -30,20 +30,22 @@ usage() {
   cat <<USAGE
 $SCRIPT_NAME v$VERSION
 
-Безопасное пошаговое обновление kubeadm-кластера Kubernetes на Linux-нode.
-Сценарий рассчитан на kubeadm + systemd + apt/yum/dnf и запуск локально на каждой node.
+Безопасное пошаговое обновление kubeadm-кластера Kubernetes на Linux node,
+а также отдельный режим jump host с обновлением только kubectl.
 
 Примеры:
   sudo $SCRIPT_NAME --role control-plane --first-control-plane true --kubeconfig /etc/kubernetes/admin.conf
   sudo $SCRIPT_NAME --role control-plane --first-control-plane false --kubeconfig /etc/kubernetes/admin.conf
   sudo $SCRIPT_NAME --role worker --kubeconfig /root/.kube/admin.conf
+  sudo $SCRIPT_NAME --role jump-host
+  sudo $SCRIPT_NAME --role jump-host --kubeconfig /root/.kube/admin.conf
   sudo $SCRIPT_NAME --role worker --kubeconfig /root/.kube/admin.conf --helm true
   sudo $SCRIPT_NAME --rollback-from /var/backups/k8s-upgrade/20260324T120000Z-node01
 
 Параметры:
-  --role <auto|control-plane|worker>
+  --role <auto|control-plane|worker|jump-host>
   --first-control-plane <true|false>   Нужен только для control-plane; true только на первой CP node в minor-шаге
-  --kubeconfig <path>                  kubeconfig с правами drain/uncordon/get; на CP по умолчанию /etc/kubernetes/admin.conf
+  --kubeconfig <path>                  Для control-plane/worker обязателен. Для jump-host опционален и нужен только для проверки связи/совместимости с кластером
   --target <vX.Y.Z>                    Целевая версия; по умолчанию последняя стабильная из dl.k8s.io/release/stable.txt
   --helm <true|false>                  Отдельно обновить Helm после Kubernetes; по умолчанию false
   --backup-root <dir>                  Корневой каталог для backup'ов; по умолчанию /var/backups/k8s-upgrade
@@ -105,7 +107,7 @@ parse_args() {
     esac
   done
 
-  case "$ROLE" in auto|control-plane|worker) ;; *) die "--role должен быть auto|control-plane|worker" ;; esac
+  case "$ROLE" in auto|control-plane|worker|jump-host) ;; *) die "--role должен быть auto|control-plane|worker|jump-host" ;; esac
   case "$FIRST_CONTROL_PLANE" in true|false) ;; *) die "--first-control-plane должен быть true|false" ;; esac
   case "$UPDATE_HELM" in true|false) ;; *) die "--helm должен быть true|false" ;; esac
   case "$ALLOW_EMPTYDIR_LOSS" in true|false) ;; *) die "--allow-emptydir-loss должен быть true|false" ;; esac
@@ -173,8 +175,10 @@ detect_role() {
   if [[ "$ROLE" == "auto" ]]; then
     if [[ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]]; then
       ROLE="control-plane"
-    else
+    elif command -v kubelet >/dev/null 2>&1 || [[ -f /var/lib/kubelet/config.yaml ]] || [[ -d /var/lib/kubelet ]]; then
       ROLE="worker"
+    else
+      ROLE="jump-host"
     fi
   fi
 
@@ -213,17 +217,40 @@ current_local_kubelet_version() {
   kubelet --version | awk '{print $2}' | sed 's/^v//'
 }
 
+current_local_kubectl_version() {
+  kubectl version --client -o yaml 2>/dev/null | awk '/gitVersion:/ {print $2; exit}' | sed 's/^v//'
+}
+
+
 fetch_latest_stable() {
   curl -fsSL https://dl.k8s.io/release/stable.txt | sed 's/^v//'
 }
 
 preflight_common() {
   require_root
-  require_cmd bash sed awk grep sort cut date mkdir cp tar systemctl kubeadm kubelet kubectl curl
+  require_cmd bash sed awk grep sort cut date mkdir cp tar curl
   detect_pkg_family
   set_default_kubeconfig
   detect_role
 
+  if [[ -z "$TARGET_VERSION" ]]; then
+    TARGET_VERSION=$(fetch_latest_stable)
+  fi
+  TARGET_VERSION=$(normalize_version "$TARGET_VERSION")
+
+  if [[ "$ROLE" == "jump-host" ]]; then
+    require_cmd kubectl
+    if [[ -z "$NODE_NAME" ]]; then
+      NODE_NAME=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo jump-host)
+    fi
+    if [[ -n "$KUBECONFIG_PATH" ]]; then
+      [[ -f "$KUBECONFIG_PATH" ]] || die "Указанный kubeconfig не найден: $KUBECONFIG_PATH"
+      kubectl --kubeconfig "$KUBECONFIG_PATH" version >/dev/null 2>&1 || die "kubectl не может подключиться к кластеру через $KUBECONFIG_PATH"
+    fi
+    return
+  fi
+
+  require_cmd systemctl kubeadm kubelet kubectl
   [[ -n "$KUBECONFIG_PATH" && -f "$KUBECONFIG_PATH" ]] || die "Нужен kubeconfig с правами drain/uncordon/get. Передай --kubeconfig <path>."
   resolve_node_name
 
@@ -233,10 +260,6 @@ preflight_common() {
 
   kubectl --kubeconfig "$KUBECONFIG_PATH" version >/dev/null 2>&1 || die "kubectl не может подключиться к кластеру через $KUBECONFIG_PATH"
   kubectl --kubeconfig "$KUBECONFIG_PATH" get node "$NODE_NAME" >/dev/null 2>&1 || die "Node '$NODE_NAME' не найдена в кластере. Укажи правильное имя через --node-name."
-  if [[ -z "$TARGET_VERSION" ]]; then
-    TARGET_VERSION=$(fetch_latest_stable)
-  fi
-  TARGET_VERSION=$(normalize_version "$TARGET_VERSION")
 
   local cur
   cur=$(current_local_kubelet_version)
@@ -261,10 +284,16 @@ metadata_file() {
 }
 
 save_metadata() {
-  local prev_kubeadm prev_kubelet prev_kubectl
-  prev_kubeadm=$(kubeadm version -o short 2>/dev/null | sed 's/^v//')
-  prev_kubelet=$(current_local_kubelet_version)
-  prev_kubectl=$(kubectl version --client -o yaml 2>/dev/null | awk '/gitVersion:/ {print $2}' | head -n1 | sed 's/^v//')
+  local prev_kubeadm="" prev_kubelet="" prev_kubectl=""
+  if command -v kubeadm >/dev/null 2>&1; then
+    prev_kubeadm=$(kubeadm version -o short 2>/dev/null | sed 's/^v//')
+  fi
+  if [[ "$ROLE" != "jump-host" ]] && command -v kubelet >/dev/null 2>&1; then
+    prev_kubelet=$(current_local_kubelet_version)
+  fi
+  if command -v kubectl >/dev/null 2>&1; then
+    prev_kubectl=$(current_local_kubectl_version)
+  fi
 
   cat > "$(metadata_file)" <<META
 ROLE=$ROLE
@@ -289,10 +318,15 @@ backup_repo_file() {
 }
 
 backup_cluster_views() {
-  run "kubectl --kubeconfig '$KUBECONFIG_PATH' version -o yaml > '$BACKUP_DIR/kubectl-version.yaml'"
-  run "kubectl --kubeconfig '$KUBECONFIG_PATH' get nodes -o wide > '$BACKUP_DIR/nodes.txt'"
-  run "kubectl --kubeconfig '$KUBECONFIG_PATH' get pods -A -o wide > '$BACKUP_DIR/pods-wide.txt'"
-  run "kubectl --kubeconfig '$KUBECONFIG_PATH' get ds,deploy,sts,svc,ing,job,cronjob,pvc,pv -A -o yaml > '$BACKUP_DIR/cluster-objects.yaml'"
+  run "kubectl version --client -o yaml > '$BACKUP_DIR/kubectl-client-version.yaml'"
+  if [[ -z "$KUBECONFIG_PATH" || ! -f "$KUBECONFIG_PATH" ]]; then
+    warn "kubeconfig не передан: пропускаю backup cluster view через kubectl."
+  else
+    run "kubectl --kubeconfig '$KUBECONFIG_PATH' version -o yaml > '$BACKUP_DIR/kubectl-version.yaml'"
+    run "kubectl --kubeconfig '$KUBECONFIG_PATH' get nodes -o wide > '$BACKUP_DIR/nodes.txt'"
+    run "kubectl --kubeconfig '$KUBECONFIG_PATH' get pods -A -o wide > '$BACKUP_DIR/pods-wide.txt'"
+    run "kubectl --kubeconfig '$KUBECONFIG_PATH' get ds,deploy,sts,svc,ing,job,cronjob,pvc,pv -A -o yaml > '$BACKUP_DIR/cluster-objects.yaml'"
+  fi
   if command -v helm >/dev/null 2>&1; then
     run "helm list -A -o yaml > '$BACKUP_DIR/helm-releases.yaml' || true"
     run "helm repo list > '$BACKUP_DIR/helm-repos.txt' || true"
@@ -442,28 +476,8 @@ build_drain_args() {
 }
 
 drain_node() {
-  local output rc=0
   log "Drain node: $NODE_NAME"
-  if output=$(kubectl --kubeconfig "$KUBECONFIG_PATH" drain $(build_drain_args) 2>&1); then
-    printf '%s
-' "$output"
-    return 0
-  fi
-  rc=$?
-
-  printf '%s
-' "$output" >&2
-
-  if grep -q "cannot delete Pods with local storage" <<<"$output"; then
-    warn "Drain остановлен: на node есть Pod'ы с emptyDir/local ephemeral storage."
-    warn "Если потеря данных в emptyDir допустима, перезапусти сценарий с флагом: --allow-emptydir-loss true"
-  fi
-
-  if grep -q "cannot evict pod as it would violate the pod's disruption budget" <<<"$output"; then
-    warn "Drain блокируется PodDisruptionBudget. Сначала увеличь доступность workload'а или временно измени PDB."
-  fi
-
-  return "$rc"
+  run "kubectl --kubeconfig '$KUBECONFIG_PATH' drain $(build_drain_args)"
 }
 
 uncordon_node() {
@@ -519,7 +533,64 @@ current_cluster_minor_from_local() {
   version_major_minor "$(current_local_kubelet_version)"
 }
 
+check_jump_host_kubectl_skew_if_possible() {
+  [[ -n "$KUBECONFIG_PATH" && -f "$KUBECONFIG_PATH" ]] || return 0
+
+  local server_version server_minor target_minor server_minor_n target_minor_n diff
+  server_version=$(kubectl --kubeconfig "$KUBECONFIG_PATH" version -o yaml 2>/dev/null | awk '
+    /serverVersion:/ {in_server=1; next}
+    in_server && /gitVersion:/ {print $2; exit}
+  ' | sed 's/^v//; s/"//g')
+  [[ -n "$server_version" ]] || return 0
+
+  server_minor=$(version_major_minor "$server_version")
+  target_minor=$(version_major_minor "$TARGET_VERSION")
+  server_minor_n=${server_minor#*.}
+  target_minor_n=${target_minor#*.}
+  diff=$(( target_minor_n - server_minor_n ))
+  if (( diff < 0 )); then
+    diff=$(( -diff ))
+  fi
+
+  if (( diff > 1 )); then
+    die "Целевой kubectl v$TARGET_VERSION выходит за поддерживаемый skew относительно kube-apiserver v$server_version. Для jump host kubectl должен быть в пределах одной minor-версии от control plane."
+  fi
+}
+
+execute_jump_host_upgrade() {
+  local current_version target_minor kubectl_pkg
+  current_version=$(current_local_kubectl_version)
+  [[ -n "$current_version" ]] || die "Не удалось определить текущую версию kubectl."
+
+  if ! version_lt "$current_version" "$TARGET_VERSION" && ! version_eq "$current_version" "$TARGET_VERSION"; then
+    die "Локальная версия kubectl $current_version новее целевой $TARGET_VERSION."
+  fi
+
+  if version_eq "$current_version" "$TARGET_VERSION"; then
+    log "Jump host уже на целевой версии kubectl v$TARGET_VERSION."
+    return
+  fi
+
+  check_jump_host_kubectl_skew_if_possible
+
+  target_minor=$(version_major_minor "$TARGET_VERSION")
+  log "Jump host: обновляю только kubectl до v$TARGET_VERSION"
+  ensure_pkgs_repo_minor "$target_minor"
+  kubectl_pkg=$(resolve_pkg_version kubectl "$TARGET_VERSION")
+  [[ -n "$kubectl_pkg" ]] || die "Не найдена версия kubectl для $TARGET_VERSION"
+  pkg_install_exact kubectl "$kubectl_pkg"
+  run "kubectl version --client"
+  if [[ -n "$KUBECONFIG_PATH" && -f "$KUBECONFIG_PATH" ]]; then
+    run "kubectl --kubeconfig '$KUBECONFIG_PATH' version"
+  fi
+}
+
 execute_upgrade() {
+  if [[ "$ROLE" == "jump-host" ]]; then
+    execute_jump_host_upgrade
+    return
+  fi
+
   local current_version current_minor target_minor next_minor step_version
   current_version=$(current_local_kubelet_version)
   target_minor=$(version_major_minor "$TARGET_VERSION")
@@ -646,11 +717,15 @@ main() {
     etcd_snapshot_if_needed
   fi
 
-  log "Старт upgrade: role=$ROLE first_control_plane=$FIRST_CONTROL_PLANE node=$NODE_NAME target=v$TARGET_VERSION"
+  log "Старт upgrade: role=$ROLE first_control_plane=$FIRST_CONTROL_PLANE node=${NODE_NAME:-n/a} target=v$TARGET_VERSION"
   execute_upgrade
   update_helm_if_requested
 
-  log "Готово. Node $NODE_NAME обновлена до Kubernetes v$(current_local_kubelet_version)."
+  if [[ "$ROLE" == "jump-host" ]]; then
+    log "Готово. Jump host обновлен: kubectl v$(current_local_kubectl_version)."
+  else
+    log "Готово. Node $NODE_NAME обновлена до Kubernetes v$(current_local_kubelet_version)."
+  fi
   log "Backup'и: $BACKUP_DIR"
   if [[ "$CONTROL_PLANE" == "true" ]]; then
     warn "Не забудь отдельно проверить/обновить CNI, device plugins и манифесты с устаревшими API версиями."

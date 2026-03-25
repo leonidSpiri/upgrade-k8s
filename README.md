@@ -1,214 +1,227 @@
 # k8s-node-upgrade.sh
 
-Безопасный пошаговый upgrade `kubeadm`-кластера Kubernetes на Linux node.
+Скрипт для пошагового обновления Kubernetes в `kubeadm`-кластере и отдельного обновления `kubectl` на jump host.
 
-Скрипт запускается **локально на каждой node**: на `control-plane` и на `worker`. Он делает preflight-проверки, создаёт backup, обновляет Kubernetes **по одной minor-версии за шаг**, умеет обновлять `kubeadm`, `kubelet`, `kubectl`, переключать `pkgs.k8s.io` repo на нужную minor-ветку и, при желании, отдельно обновлять Helm.
+Поддерживаемые режимы:
+- `control-plane`
+- `worker`
+- `jump-host`
+- `auto` — пытается определить роль автоматически
 
-> Скрипт рассчитан на `kubeadm + Linux + systemd + apt/yum/dnf/dnf5`.
+Скрипт рассчитан на Linux с `apt`, `yum`, `dnf` или `dnf5`.
 
 ---
 
 ## Что делает скрипт
 
-На каждой node скрипт:
+### Для `control-plane`
+- делает preflight-проверки;
+- создаёт локальные backup'ы;
+- переключает `pkgs.k8s.io` repo на нужную minor-ветку;
+- обновляет `kubeadm`;
+- выполняет `kubeadm upgrade apply` на первой control-plane node и `kubeadm upgrade node` на остальных;
+- делает `drain` node;
+- обновляет `kubelet` и `kubectl`;
+- перезапускает `kubelet`;
+- ждёт `Ready` и делает `uncordon`.
 
-1. Определяет роль node: `control-plane` или `worker`.
-2. Проверяет доступ к кластеру через `kubectl` и `kubeconfig`.
-3. Определяет текущую локальную версию `kubelet`.
-4. Получает целевую версию:
-   - либо из `--target vX.Y.Z`
-   - либо автоматически из `https://dl.k8s.io/release/stable.txt`
-5. Если требуется minor-upgrade, **идёт последовательно по всем промежуточным minor-версиям**.
-6. До начала upgrade делает preflight-проверки, в том числе проверяет, что `drain` не упрётся в очевидные блокеры.
-7. Перед обновлением создаёт локальные backup'ы:
-   - состояние node и cluster view через `kubectl`
-   - текущий repo file
-   - на `control-plane`: `/etc/kubernetes`, `kubelet` config
-   - на `control-plane` со `stacked etcd`: `etcd` snapshot
-8. Для каждого upgrade-step:
-   - переключает пакетный репозиторий на нужную minor-ветку `pkgs.k8s.io`
-   - обновляет `kubeadm`
-   - выполняет `kubeadm upgrade apply` или `kubeadm upgrade node`
-   - делает `drain` node
-   - обновляет `kubelet` и `kubectl`
-   - перезапускает `kubelet`
-   - ждёт `Ready`
-   - делает `uncordon`
-9. Если указан `--helm true`, отдельно обновляет Helm через официальный installer script.
+### Для `worker`
+- делает preflight-проверки;
+- создаёт локальные backup'ы;
+- переключает `pkgs.k8s.io` repo на нужную minor-ветку;
+- обновляет `kubeadm`;
+- выполняет `kubeadm upgrade node`;
+- делает `drain` node;
+- обновляет `kubelet` и `kubectl`;
+- перезапускает `kubelet`;
+- ждёт `Ready` и делает `uncordon`.
+
+### Для `jump-host`
+- обновляет **только** `kubectl`;
+- не делает `drain`;
+- не трогает `kubeadm`, `kubelet`, `etcd`, `/etc/kubernetes`;
+- при наличии `--kubeconfig` дополнительно проверяет подключение к кластеру и не даёт обновить `kubectl` на неподдерживаемую minor-версию относительно `kube-apiserver`.
 
 ---
 
 ## Что именно обновляется
 
-Скрипт обновляет:
-
+### В режимах `control-plane` и `worker`
 - `kubeadm`
 - `kubelet`
 - `kubectl`
-- `pkgs.k8s.io` repo file на нужную minor-ветку
-- `control-plane` компоненты через `kubeadm upgrade apply`
-- `worker` node конфигурацию через `kubeadm upgrade node`
-- Helm, если задан `--helm true`
+- repo file Kubernetes packages (`pkgs.k8s.io`)
+- локальная node-конфигурация через `kubeadm upgrade`
+
+### В режиме `jump-host`
+- только `kubectl`
+- при `--helm true` — ещё и Helm
 
 ---
 
 ## Что скрипт не обновляет
 
-Это сделано специально, чтобы не автоматизировать то, где у разных кластеров слишком много vendor-specific отличий.
-
-Скрипт **не** обновляет автоматически:
-
-- CNI plugin
-- CSI drivers
-- device plugins
+Скрипт специально **не** обновляет автоматически:
+- CNI
+- CSI
 - ingress-controller
-- сторонние operators
+- operators
+- device plugins
 - container runtime
 - ОС и kernel
-- ваши приложения, Helm charts и их values
-- манифесты с deprecated API versions
+- ваши workload'ы
+- Helm charts и values
+- manifest'ы с deprecated API versions
 
-После cluster upgrade это нужно проверять отдельно по документации конкретного компонента.
+Это нужно обновлять отдельно по документации конкретного компонента.
 
 ---
 
-## Почему upgrade идёт по каждой minor-версии
+## Почему обновление идёт по каждой minor-версии
 
-Потому что для `kubeadm` **перескакивать через minor-версии нельзя**.
+Потому что для `kubeadm` **нельзя перескакивать через minor-версии**.
 
 Официальная документация Kubernetes прямо говорит:
 
 > `Skipping MINOR versions when upgrading is unsupported.`
 
-Практический смысл такой:
+Кроме того, для `pkgs.k8s.io` используется **отдельный репозиторий на каждую minor-ветку**, и при переходе между minor-версиями repo тоже нужно переключать.
 
-- уменьшается риск несовместимости конфигов и API;
-- соблюдается `version skew policy`;
-- `kubeadm` ожидает поддерживаемую последовательность переходов;
-- на `pkgs.k8s.io` пакеты разложены по **отдельным minor-репозиториям**, поэтому при каждом minor-upgrade нужно переключать repo.
-
-Именно поэтому скрипт не пытается делать прыжок вида:
-
-```text
-1.31 -> 1.35
-```
-
-А строит цепочку шагов:
+Именно поэтому скрипт строит цепочку такого вида:
 
 ```text
 1.31.x -> 1.32.latest -> 1.33.latest -> 1.34.latest -> 1.35.latest
 ```
 
-### Источники
+а не пытается делать скачок:
 
-- Kubernetes: Upgrading kubeadm clusters  
+```text
+1.31 -> 1.35
+```
+
+### Источники
+- Upgrading kubeadm clusters  
   https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-upgrade/
-- Kubernetes: Changing the Kubernetes package repository  
+- Changing The Kubernetes Package Repository  
   https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/change-package-repository/
 
 ---
 
 ## Зачем нужен kubeconfig на worker
 
-Скрипт запускается **локально на worker node**, но часть действий он делает **через Kubernetes API**, а не только локально в ОС.
-
-В частности, скрипт вызывает:
-
+На `worker` скрипт выполняет не только локальные действия в ОС, но и команды через Kubernetes API:
 - `kubectl get node`
 - `kubectl drain <node>`
 - `kubectl wait --for=condition=Ready node/...`
 - `kubectl uncordon <node>`
 
-Эти команды работают не “с локальной машиной напрямую”, а **с кластером через API server**. Поэтому `kubectl` должен знать:
+Эти команды работают через `kube-apiserver`, а не напрямую с локальной машиной.
 
-- куда подключаться;
-- как аутентифицироваться;
-- какой CA использовать;
-- какие права есть у пользователя.
+Поэтому на `worker` нужен `kubeconfig`, в котором есть:
+- адрес API server;
+- CA;
+- credentials;
+- права на `get`, `drain`, `uncordon`, `wait`.
 
-Всё это хранится в `kubeconfig`.
-
-Без `kubeconfig` worker не сможет:
-
-- безопасно вывести себя из эксплуатации через `drain`;
-- дождаться подтверждения `Ready` от кластера;
-- вернуть себя обратно через `uncordon`.
-
-То есть локально обновить пакеты на worker можно и без `kubeconfig`, но **безопасный orchestration upgrade в одном скрипте — уже нет**.
+Без `kubeconfig` можно локально обновить пакет `kubectl`, но нельзя безопасно вывести node из эксплуатации и вернуть её обратно.
 
 ### Источники
-
-- Kubernetes: Upgrading Linux nodes  
+- Upgrading Linux nodes  
   https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/upgrading-linux-nodes/
-- Kubernetes: kubectl drain  
+- kubectl drain  
   https://kubernetes.io/docs/reference/kubectl/generated/kubectl_drain/
-- Kubernetes: Organizing Cluster Access Using kubeconfig Files  
+- Organizing Cluster Access Using kubeconfig Files  
   https://kubernetes.io/docs/concepts/configuration/organize-cluster-access-kubeconfig/
 
 ---
 
-## Какой kubeconfig использовать на worker
+## Jump host: важное ограничение по версии kubectl
 
-### Самый простой вариант
+Для `jump-host` скрипт обновляет только `kubectl`. Но `kubectl` не должен быть слишком далеко по minor-версии от `kube-apiserver`.
 
-Временно положить на worker `root-only` kubeconfig, который точно имеет нужные права.
+Официальное правило такое:
 
-Например:
+> `kubectl` is supported within one minor version (older or newer) of `kube-apiserver`.
 
-```bash
-sudo install -d -m 0700 /root/.kube
-sudo cp /etc/kubernetes/admin.conf /root/.kube/admin.conf
-sudo chmod 0600 /root/.kube/admin.conf
-```
+Поэтому, если запускать режим `jump-host` с `--kubeconfig`, скрипт дополнительно проверяет version skew и останавливается, если целевая версия `kubectl` выходит за допустимый диапазон.
 
-И запускать:
+Это сделано специально, чтобы не обновить jump host до версии клиента, которая уже не поддерживается твоим control plane.
 
-```bash
-sudo ./k8s-node-upgrade.sh --role worker --kubeconfig /root/.kube/admin.conf
-```
-
-### Более аккуратный вариант
-
-Использовать **отдельный kubeconfig** для upgrade-операций, а не `admin.conf`.
-
-Это лучше с точки зрения безопасности, потому что можно:
-
-- хранить отдельные учётные данные;
-- ограничить срок жизни доступа;
-- контролировать, где именно этот kubeconfig размещён.
-
-### Важное замечание по безопасности
-
-Официальная документация Kubernetes отдельно предупреждает: использовать нужно только `kubeconfig` из доверенных источников.
+### Источники
+- Install and Set Up kubectl on Linux  
+  https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+- Version Skew Policy  
+  https://kubernetes.io/releases/version-skew-policy/
 
 ---
 
-## Новое поведение drain: precheck и защита от потери данных
+## Backup'и
 
-Перед началом upgrade скрипт делает **предварительную проверку** `drain` через `kubectl drain --dry-run=server`.
+Перед изменениями скрипт создаёт каталог backup, по умолчанию:
 
-Это нужно, чтобы заранее остановиться, если node нельзя безопасно освободить.
+```bash
+/var/backups/k8s-upgrade/<timestamp>-<node>
+```
 
-Сейчас скрипт специально проверяет как минимум два типовых блокера:
+Туда попадает:
+- metadata о версии и параметрах запуска;
+- backup repo file;
+- `kubectl` client version;
+- cluster views через `kubectl`, если есть `kubeconfig`;
+- список Helm releases и repo, если Helm установлен;
+- на `control-plane`: архив `/etc/kubernetes` и `kubelet` config;
+- на `control-plane` со `stacked etcd`: snapshot `etcd`.
 
-1. **Pods с local ephemeral storage / emptyDir**
-2. **PodDisruptionBudget**, который не позволяет эвиктить pod'ы
+### Важный момент по `etcd`
 
-### Если на node есть Pod'ы с emptyDir
+В текущей версии скрипта для snapshot `stacked etcd` требуется **`etcdctl` на host**.
 
-По умолчанию сценарий **останавливается**, чтобы не потерять данные из `emptyDir`.
+Если на control-plane нет `etcdctl` в `PATH`, скрипт остановится с ошибкой:
 
-В логах это выглядит примерно так:
+```text
+ERROR: Не найдена команда: etcdctl
+```
+
+В таком случае нужно либо:
+- установить `etcdctl` на host;
+- либо доработать скрипт под работу через `etcd` static pod.
+
+---
+
+## Откат
+
+Есть только **node-local rollback**:
+- откат repo file;
+- откат пакетов `kubeadm`, `kubelet`, `kubectl`, если их предыдущие версии сохранены в metadata;
+- восстановление `/etc/kubernetes` и `kubelet` config, если они были сохранены.
+
+Запуск:
+
+```bash
+sudo ./k8s-node-upgrade.sh --rollback-from /var/backups/k8s-upgrade/<backup_dir>
+```
+
+### Что rollback не делает
+
+Скрипт **не** делает автоматический cluster-wide restore `etcd`.
+
+Это сделано намеренно: полный restore `etcd` — отдельная процедура disaster recovery, её нельзя безопасно автоматизировать как "просто откат одной node".
+
+---
+
+## Работа с `emptyDir` и local ephemeral storage
+
+Во время `drain` Kubernetes может остановить процесс, если на node есть Pod'ы с local storage / `emptyDir`.
+
+Типичная ошибка выглядит так:
 
 ```text
 cannot delete Pods with local storage (use --delete-emptydir-data to override)
 ```
 
-Это штатное поведение `kubectl drain`.
+По умолчанию скрипт **не** добавляет `--delete-emptydir-data`, чтобы не потерять временные данные автоматически.
 
-### Что делать в этом случае
-
-Если для этих pod'ов **допустима потеря временных данных**, можно явно разрешить такой drain:
+Если ты понимаешь, что потеря `emptyDir` допустима, запускай так:
 
 ```bash
 sudo ./k8s-node-upgrade.sh \
@@ -217,114 +230,61 @@ sudo ./k8s-node-upgrade.sh \
   --allow-emptydir-loss true
 ```
 
-Этот флаг добавляет к `drain` параметр:
+Этот флаг добавляет к `drain`:
 
 ```bash
 --delete-emptydir-data
 ```
 
-### Когда включать `--allow-emptydir-loss true`
-
-Только если ты понимаешь, что `emptyDir` в этих pod'ах используется как:
-
+### Когда это можно включать
 - cache
-- temp storage
+- temp files
 - scratch space
-- промежуточные файлы, которые допустимо потерять
+- промежуточные данные, которые допустимо потерять
 
-### Когда не включать
-
-Не включай этот флаг вслепую, если приложение хранит в `emptyDir` важное runtime-состояние, которое после eviction пропадёт.
+### Когда нельзя включать вслепую
+Если приложение складывает в `emptyDir` важное runtime-состояние, оно пропадёт после eviction pod'а.
 
 ### Источники
-
-- Kubernetes: kubectl drain  
+- kubectl drain  
   https://kubernetes.io/docs/reference/kubectl/generated/kubectl_drain/
-- Kubernetes: Volumes / emptyDir  
+- Volumes / emptyDir  
   https://kubernetes.io/docs/concepts/storage/volumes/
 
 ---
 
-## Что будет, если drain блокируется PodDisruptionBudget
+## Как скачать из Git
 
-Если `drain` нельзя выполнить из-за `PDB`, скрипт останавливается ещё на precheck.
+### Вариант 1: clone репозитория
 
-В этом случае нужно сначала:
+```bash
+git clone <repo-url>
+cd <repo-dir>
+chmod +x k8s-node-upgrade.sh
+```
 
-- увеличить количество реплик;
-- временно изменить `PodDisruptionBudget`;
-- убедиться, что workload может безопасно пережить eviction.
+### Вариант 2: скачать только файл скрипта из raw URL
+
+```bash
+curl -fsSL -o k8s-node-upgrade.sh <raw-url-to-k8s-node-upgrade.sh>
+chmod +x k8s-node-upgrade.sh
+```
+
+### Вариант 3: скачать и README
+
+```bash
+curl -fsSL -o k8s-node-upgrade.sh <raw-url-to-k8s-node-upgrade.sh>
+curl -fsSL -o README.md <raw-url-to-README.md>
+chmod +x k8s-node-upgrade.sh
+```
+
+Если у тебя приватный GitLab/GitHub, вместо `<repo-url>` и `<raw-url-...>` подставь реальные адреса своего репозитория.
 
 ---
 
-## Что делать, если предыдущий запуск упал во время drain
+## Примеры запуска
 
-Если использовалась **старая версия скрипта** или ошибка произошла уже после начала реального `drain`, node может остаться в состоянии `SchedulingDisabled`.
-
-Тогда её нужно вернуть вручную:
-
-```bash
-kubectl --kubeconfig /etc/kubernetes/admin.conf uncordon <node-name>
-```
-
-Пример:
-
-```bash
-kubectl --kubeconfig /etc/kubernetes/admin.conf uncordon deb13-jh-k8s-worker-2
-```
-
-Перед повторным запуском проверь:
-
-```bash
-kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes
-```
-
----
-
-## Требования и ограничения
-
-### Control-plane
-
-Для `control-plane` скрипту нужны:
-
-- `kubeadm`
-- `kubelet`
-- `kubectl`
-- `curl`
-- доступный `kubeconfig`
-- для `stacked etcd`: установленный на host `etcdctl`
-
-Если на `control-plane` используется локальный `stacked etcd`, скрипт делает snapshot через `etcdctl` на host.
-
-Если `etcdctl` не установлен, сценарий остановится с ошибкой:
-
-```text
-ERROR: Не найдена команда: etcdctl
-```
-
-В таком случае перед запуском нужно либо установить `etcdctl`, либо доработать сценарий под использование `etcdctl` из static pod.
-
-### Worker
-
-Для `worker` нужны:
-
-- `kubeadm`
-- `kubelet`
-- `kubectl`
-- `curl`
-- `kubeconfig` с правами на `get/drain/wait/uncordon`
-
----
-
-## Порядок upgrade по ролям
-
-Официальный порядок такой:
-
-1. Первая `control-plane` node
-2. Остальные `control-plane` nodes
-3. `worker` nodes
-
-### Первая control-plane
+### Первая control-plane node
 
 ```bash
 sudo ./k8s-node-upgrade.sh \
@@ -333,7 +293,7 @@ sudo ./k8s-node-upgrade.sh \
   --kubeconfig /etc/kubernetes/admin.conf
 ```
 
-### Остальные control-plane
+### Остальные control-plane nodes
 
 ```bash
 sudo ./k8s-node-upgrade.sh \
@@ -342,7 +302,7 @@ sudo ./k8s-node-upgrade.sh \
   --kubeconfig /etc/kubernetes/admin.conf
 ```
 
-### Worker
+### Worker node
 
 ```bash
 sudo ./k8s-node-upgrade.sh \
@@ -350,7 +310,7 @@ sudo ./k8s-node-upgrade.sh \
   --kubeconfig /root/.kube/admin.conf
 ```
 
-### Worker с разрешением потери `emptyDir`
+### Worker node с разрешением удалить `emptyDir`
 
 ```bash
 sudo ./k8s-node-upgrade.sh \
@@ -359,228 +319,60 @@ sudo ./k8s-node-upgrade.sh \
   --allow-emptydir-loss true
 ```
 
-### С отдельным обновлением Helm
+### Jump host без доступа к кластеру
+
+```bash
+sudo ./k8s-node-upgrade.sh --role jump-host
+```
+
+### Jump host с проверкой совместимости через kubeconfig
 
 ```bash
 sudo ./k8s-node-upgrade.sh \
-  --role worker \
-  --kubeconfig /root/.kube/admin.conf \
-  --helm true
+  --role jump-host \
+  --kubeconfig /root/.kube/admin.conf
+```
+
+### Любой режим + Helm
+
+```bash
+sudo ./k8s-node-upgrade.sh --role jump-host --helm true
+```
+
+или
+
+```bash
+sudo ./k8s-node-upgrade.sh --role worker --kubeconfig /root/.kube/admin.conf --helm true
 ```
 
 ---
 
-## Как работает upgrade внутри скрипта
+## Как работает `--role auto`
 
-### Control-plane
+Скрипт пытается определить роль так:
+- если найден `/etc/kubernetes/manifests/kube-apiserver.yaml` → `control-plane`;
+- если есть `kubelet` или следы его конфигурации → `worker`;
+- иначе → `jump-host`.
 
-На первой `control-plane` node:
-
-- обновляется `kubeadm`
-- выполняется `kubeadm upgrade plan`
-- выполняется `kubeadm upgrade apply vX.Y.Z`
-- node переводится в `drain`
-- обновляются `kubelet` и `kubectl`
-- рестартуется `kubelet`
-- проверяется `Ready`
-- выполняется `uncordon`
-
-На остальных `control-plane` node:
-
-- обновляется `kubeadm`
-- выполняется `kubeadm upgrade node`
-- дальше те же шаги с `drain`, `kubelet`, `kubectl`, `Ready`, `uncordon`
-
-### Worker
-
-На `worker` node:
-
-- обновляется `kubeadm`
-- выполняется `kubeadm upgrade node`
-- node переводится в `drain`
-- обновляются `kubelet` и `kubectl`
-- рестартуется `kubelet`
-- выполняется проверка `Ready`
-- node возвращается через `uncordon`
+Если не хочешь полагаться на auto-detection, лучше указывать `--role` явно.
 
 ---
 
-## Backup и rollback
+## Полезные замечания
 
-### Что сохраняется
-
-В каталог backup'а сохраняются:
-
-- `kubectl version`
-- список node
-- список pod'ов
-- cluster objects (`ds`, `deploy`, `sts`, `svc`, `ing`, `job`, `cronjob`, `pvc`, `pv`)
-- Helm releases и repos, если Helm установлен
-- repo file
-- `/etc/kubernetes` на `control-plane`
-- `kubelet` config
-- `etcd` snapshot на `stacked etcd`
-- `metadata.env` для node-local rollback
-
-### Где лежат backup'ы
-
-По умолчанию:
-
-```text
-/var/backups/k8s-upgrade
-```
-
-### Откат
-
-Скрипт поддерживает **node-local rollback** из backup directory:
-
-```bash
-sudo ./k8s-node-upgrade.sh --rollback-from /var/backups/k8s-upgrade/<backup_dir>
-```
-
-Важно: это **не полный cluster-wide restore** и не автоматическое восстановление всего control-plane state. Полное восстановление etcd и cluster state нужно делать отдельно по процедуре Kubernetes.
+1. Сначала обновляется первая `control-plane` node.
+2. Потом остальные `control-plane` nodes.
+3. Потом `worker` nodes.
+4. `jump-host` имеет смысл обновлять после того, как control plane уже приблизился к целевой версии, чтобы не нарушить supported skew для `kubectl`.
+5. После cluster upgrade отдельно проверь CNI, ingress, operators, monitoring stack и свои приложения.
 
 ---
 
-## Параметры
+## Короткий summary
 
-```text
---role <auto|control-plane|worker>
---first-control-plane <true|false>
---kubeconfig <path>
---target <vX.Y.Z>
---helm <true|false>
---backup-root <dir>
---node-name <name>
---allow-emptydir-loss <true|false>
---dry-run
---rollback-from <backup_dir>
---force-repo-switch
-```
-
----
-
-## Как скачать из Git
-
-### Вариант 1. Склонировать весь репозиторий
-
-```bash
-git clone <repo-url>
-cd <repo-dir>
-chmod +x k8s-node-upgrade.sh
-```
-
-Пример:
-
-```bash
-git clone https://github.com/your-org/k8s-node-upgrade.git
-cd k8s-node-upgrade
-chmod +x k8s-node-upgrade.sh
-```
-
-### Вариант 2. Скачать один файл напрямую
-
-Если в репозитории есть raw URL:
-
-```bash
-curl -fsSL -o k8s-node-upgrade.sh <raw-url>
-chmod +x k8s-node-upgrade.sh
-```
-
-Пример:
-
-```bash
-curl -fsSL -o k8s-node-upgrade.sh https://raw.githubusercontent.com/your-org/k8s-node-upgrade/main/k8s-node-upgrade.sh
-chmod +x k8s-node-upgrade.sh
-```
-
-### Вариант 3. Скачать README отдельно
-
-```bash
-curl -fsSL -o README.md <raw-readme-url>
-```
-
----
-
-## Как пользоваться после скачивания
-
-### 1. Проверить доступы
-
-Убедись, что на node есть:
-
-- `root`/`sudo`
-- корректный `kubeconfig`
-- доступ к пакетному репозиторию Kubernetes
-- установленный `kubectl`
-
-### 2. Сделать файл исполняемым
-
-```bash
-chmod +x ./k8s-node-upgrade.sh
-```
-
-### 3. Запускать по правильному порядку
-
-Сначала первая `control-plane`, потом остальные `control-plane`, потом `worker`.
-
-### 4. После каждого шага проверить состояние
-
-```bash
-kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
-kubectl --kubeconfig /etc/kubernetes/admin.conf get pods -A -o wide
-```
-
----
-
-## Helm
-
-Если указан флаг:
-
-```bash
---helm true
-```
-
-скрипт отдельно обновит Helm через официальный installer script Helm.
-
-В текущей реализации используется installer для Helm 4.
-
-Перед включением этого флага проверь, что:
-
-- твои automation/jobs совместимы с Helm 4;
-- плагины, если они используются, тоже совместимы.
-
-Источник:
-
-- Helm install docs  
-  https://helm.sh/docs/intro/install/
-
----
-
-## Рекомендации по безопасному использованию
-
-1. Сначала прогоняй upgrade на тестовом кластере.
-2. Не включай `--allow-emptydir-loss true`, пока не понял, что именно лежит в `emptyDir`.
-3. Перед `control-plane` upgrade отдельно проверь стратегию восстановления `etcd`.
-4. Не пытайся обновить сразу все node параллельно.
-5. После каждой node проверяй `Ready`, `pods`, critical workloads и monitoring.
-
----
-
-## Основные официальные источники
-
-- Kubernetes: Upgrading kubeadm clusters  
-  https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-upgrade/
-- Kubernetes: Upgrading Linux nodes  
-  https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/upgrading-linux-nodes/
-- Kubernetes: Change the package repository  
-  https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/change-package-repository/
-- Kubernetes: kubectl drain  
-  https://kubernetes.io/docs/reference/kubectl/generated/kubectl_drain/
-- Kubernetes: kubeconfig  
-  https://kubernetes.io/docs/concepts/configuration/organize-cluster-access-kubeconfig/
-- Kubernetes: Volumes / emptyDir  
-  https://kubernetes.io/docs/concepts/storage/volumes/
-- Helm install docs  
-  https://helm.sh/docs/intro/install/
-- Kubernetes stable release pointer  
-  https://dl.k8s.io/release/stable.txt
+- `control-plane` и `worker` режимы обновляют Kubernetes node полностью.
+- `jump-host` обновляет только `kubectl`.
+- На `worker` нужен `kubeconfig`, потому что `drain/uncordon/wait` идут через API server.
+- Через minor-версии перепрыгивать нельзя.
+- Для `jump-host` лучше передавать `--kubeconfig`, чтобы скрипт проверил supported version skew.
+- Для `stacked etcd` в текущей версии скрипта нужен `etcdctl` на host.
