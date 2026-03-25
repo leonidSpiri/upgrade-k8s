@@ -78,7 +78,7 @@
 
 Потому что для `kubeadm` **перескакивать через minor-версии нельзя**.
 
-Официальная документация Kubernetes прямо говорит:
+Официальная документация Kubernetes:
 
 - `Skipping MINOR versions when upgrading is unsupported.`
 - Документация на актуальный шаг описывает upgrade, например, **с 1.34.x на 1.35.x** и отдельно patch upgrade внутри той же minor-ветки.
@@ -521,50 +521,10 @@ sudo ./k8s-node-upgrade.sh \
 
 ---
 
-## Как скачать из Git
-
-Ниже шаблоны. Подставь свой URL репозитория.
-
-### Вариант 1: клонировать репозиторий целиком
-
-#### HTTPS
+## Как скачать
 
 ```bash
 git clone https://github.com/<org>/<repo>.git
-cd <repo>
-chmod +x k8s-node-upgrade.sh
-chmod +x test_k8s_node_upgrade.sh
-```
-
-#### SSH
-
-```bash
-git clone git@github.com:<org>/<repo>.git
-cd <repo>
-chmod +x k8s-node-upgrade.sh
-chmod +x test_k8s_node_upgrade.sh
-```
-
-### Вариант 2: скачать только скрипт напрямую
-
-Если репозиторий публичный:
-
-```bash
-curl -LO https://raw.githubusercontent.com/<org>/<repo>/<branch>/k8s-node-upgrade.sh
-chmod +x k8s-node-upgrade.sh
-```
-
-И для теста:
-
-```bash
-curl -LO https://raw.githubusercontent.com/<org>/<repo>/<branch>/test_k8s_node_upgrade.sh
-chmod +x test_k8s_node_upgrade.sh
-```
-
-### Вариант 3: скачать конкретный tag/release
-
-```bash
-git clone --branch <tag-or-branch> --depth 1 https://github.com/<org>/<repo>.git
 cd <repo>
 chmod +x k8s-node-upgrade.sh
 chmod +x test_k8s_node_upgrade.sh
